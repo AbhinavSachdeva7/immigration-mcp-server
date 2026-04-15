@@ -1,0 +1,32 @@
+version: "3.9"
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: immigration_mcp_db
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: immigration_mcp
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/01_init.sql
+
+  mcp-server:
+    build: .
+    container_name: immigration_mcp_server
+    depends_on:
+      - db
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@db:5432/immigration_mcp
+      DATA_INDEXED_DATE: "2026-03-14"
+      MCP_TRANSPORT: sse
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data  # mount raw data files for ingestion
+
+volumes:
+  pgdata:
