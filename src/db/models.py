@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Text, ForeignKey, JSON, Decimal, Boolean, DateTime, Index
+from sqlalchemy import Column, Integer, String, Text, ForeignKey, JSON, Numeric, Boolean, DateTime, Index
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 from .database import Base
@@ -101,8 +101,8 @@ class OFLCWage(Base):
     soc_title = Column(Text)
     msa_area = Column(Text, index=True)
     wage_level = Column(Integer)
-    hourly_wage = Column(Decimal)
-    yearly_wage = Column(Decimal)
+    hourly_wage = Column(Numeric)
+    yearly_wage = Column(Numeric)
 
 
 class MSAMapping(Base):

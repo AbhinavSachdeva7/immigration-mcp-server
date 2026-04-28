@@ -2,3 +2,8 @@
 data/
 .claude
 context
+
+**/__pycache__
+**/*.pyc
+
+src/immigration_mcp_server.egg-info

@@ -18,10 +18,10 @@ def clear_onet_tables(db: Session):
 def _determine_soc_level(soc_code: str) -> int:
     """Determine hierarchy level from SOC code format.
 
-    BLS SOC structure:
+    BLS SOC structure (works for both 2010 and 2018 SOC):
       XX-0000  → Level 0 (Major Group, ~23 groups)
-      XX-X000  → Level 1 (Minor Group)
-      XX-XXX0  → Level 2 (Broad Occupation)
+      XX-XX00  → Level 1 (Minor Group, e.g. 15-1000 or 15-1200)
+      XX-XXX0  → Level 2 (Broad Occupation, e.g. 15-1010 or 15-1250)
       XX-XXXX  → Level 3 (Detailed Occupation)
 
     O*NET extensions:
@@ -35,7 +35,7 @@ def _determine_soc_level(soc_code: str) -> int:
     suffix = base[1]
     if suffix == "0000":
         return 0
-    elif suffix.endswith("000"):
+    elif suffix.endswith("00"):
         return 1
     elif suffix.endswith("0"):
         return 2
@@ -43,28 +43,46 @@ def _determine_soc_level(soc_code: str) -> int:
         return 3
 
 
-def _determine_parent_code(soc_code: str, level: int) -> str | None:
-    """Determine parent SOC code based on hierarchy level."""
+def _determine_parent_code(soc_code: str, level: int, known_codes: set | None = None) -> str | None:
+    """Determine parent SOC code. Uses known_codes set to find nearest real ancestor."""
     if level == 0:
         return None
 
+    if "." in soc_code:
+        return soc_code.split(".")[0]
+
     parts = soc_code.split("-")
     major = parts[0]
+    suffix = parts[1]
 
     if level == 1:
         return f"{major}-0000"
-    elif level == 2:
-        # Minor group: XX-X000
-        return f"{major}-{parts[1][0]}000"
-    elif level == 3:
-        # Broad group: XX-XXX0
-        return f"{major}-{parts[1][:3]}0"
-    elif level == 4:
-        # O*NET extension → parent is the base detailed SOC code
-        base_code = soc_code.split(".")[0]
-        return base_code
 
-    return None
+    # For levels 2 and 3, try candidates from most specific to least specific.
+    # This handles irregular BLS SOC groupings where the "obvious" parent code
+    # (e.g. 11-3100 for 11-3120) may not exist in the actual data file.
+    if level == 2:
+        candidates = [
+            f"{major}-{suffix[:2]}00",  # natural minor group
+            f"{major}-{suffix[0]}000",  # old-style minor group
+            f"{major}-0000",            # major group fallback
+        ]
+    else:  # level == 3
+        candidates = [
+            f"{major}-{suffix[:3]}0",   # natural broad occupation
+            f"{major}-{suffix[:2]}00",  # minor group fallback
+            f"{major}-{suffix[0]}000",  # old-style minor group fallback
+            f"{major}-0000",            # major group fallback
+        ]
+
+    if known_codes is not None:
+        for candidate in candidates:
+            if candidate != soc_code and candidate in known_codes:
+                return candidate
+        return f"{major}-0000"
+
+    # No known_codes provided — return best guess (first candidate)
+    return candidates[0]
 
 
 def ingest_soc_structure(db: Session, file_path: Path):
@@ -79,28 +97,26 @@ def ingest_soc_structure(db: Session, file_path: Path):
     """
     print(f"Ingesting BLS SOC structure from {file_path}...")
 
-    # Read all rows first, then sort by level so parents are inserted before children
-    rows_by_level = {0: [], 1: [], 2: [], 3: []}
+    # Two-pass read:
+    #   Pass 1 — collect every real SOC code so parent lookup can find nearest ancestor
+    #   Pass 2 — build rows with verified parent codes
+    raw_rows = []
+    known_codes: set = set()
 
     with open(file_path, 'r', encoding='utf-8') as f:
-        reader = csv.DictReader(f)
-        # Normalize column names — BLS files vary in header naming
-        for row in reader:
-            # Try common column name patterns
+        for row in csv.DictReader(f):
             soc_code = (
                 row.get('SOC Code', '') or
                 row.get('SOC_CODE', '') or
                 row.get('O*NET-SOC Code', '') or
                 row.get('code', '')
             ).strip()
-
             title = (
                 row.get('SOC Title', '') or
                 row.get('SOC_TITLE', '') or
                 row.get('Title', '') or
                 row.get('title', '')
             ).strip()
-
             description = (
                 row.get('SOC Definition', '') or
                 row.get('SOC_DEFINITION', '') or
@@ -109,26 +125,26 @@ def ingest_soc_structure(db: Session, file_path: Path):
                 ''
             ).strip()
 
-            if not soc_code or not title:
+            if not soc_code or not title or "." in soc_code:
                 continue
-
-            # Skip O*NET extensions in this step — those come from O*NET data
-            if "." in soc_code:
-                continue
-
             level = _determine_soc_level(soc_code)
             if level > 3:
                 continue
 
-            parent_code = _determine_parent_code(soc_code, level)
+            known_codes.add(soc_code)
+            raw_rows.append((soc_code, title, description, level))
 
-            rows_by_level[level].append({
-                "soc_code": soc_code,
-                "title": title,
-                "description": description,
-                "parent_soc_code": parent_code,
-                "level": level,
-            })
+    # Build level-bucketed rows with parent resolved against actual known codes
+    rows_by_level = {0: [], 1: [], 2: [], 3: []}
+    for soc_code, title, description, level in raw_rows:
+        parent_code = _determine_parent_code(soc_code, level, known_codes)
+        rows_by_level[level].append({
+            "soc_code": soc_code,
+            "title": title,
+            "description": description,
+            "parent_soc_code": parent_code,
+            "level": level,
+        })
 
     # Insert level by level (0 → 1 → 2 → 3) so parents exist before children
     total = 0

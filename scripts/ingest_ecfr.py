@@ -16,7 +16,7 @@ Citation format: "8 CFR § {section}({subsection})"
 
 API endpoints used:
   - Structure: GET /api/versioner/v1/structure/current/title-8.json
-  - Content:   GET /api/renderer/v1/content/enhanced/current/title-8?part=214&section=214.2
+  - Content:   GET /api/versioner/v1/full/current/title-8/part-{part}/section-{section}
 
 Usage:
     # Fetch Parts 204, 214, 245 from eCFR
@@ -54,7 +54,7 @@ from src.db.models import Node, NodeCrossReference
 
 ECFR_BASE = "https://www.ecfr.gov"
 STRUCTURE_URL = f"{ECFR_BASE}/api/versioner/v1/structure/current/title-8.json"
-CONTENT_URL = f"{ECFR_BASE}/api/renderer/v1/content/enhanced/current/title-8"
+CONTENT_URL = f"{ECFR_BASE}/api/versioner/v1/full/2026-04-21/title-8.xml"
 
 DEFAULT_DATA_DIR = Path("./data/ecfr")
 DEFAULT_PARTS = [204, 214, 245]
@@ -181,25 +181,25 @@ class ECFRFetcher:
             if not sect_id:
                 continue
 
-            # Fetch section HTML
+            # Fetch section XML
             url = f"{CONTENT_URL}?part={part_num}&section={sect_id}"
             resp = self._fetch(url)
             if not resp:
                 print(f"    {sect_id}: FAILED")
                 continue
 
-            html = resp.text
+            xml = resp.text
 
-            # Save section HTML
+            # Save section XML
             safe_name = sect_id.replace(".", "_")
-            html_path = part_dir / f"section-{safe_name}.html"
-            html_path.write_text(html, encoding="utf-8")
+            xml_path = part_dir / f"section-{safe_name}.xml"
+            xml_path.write_text(xml, encoding="utf-8")
 
             manifest["sections"].append({
                 "identifier": sect_id,
                 "label": sect.get("label", ""),
                 "label_description": sect.get("label_description", ""),
-                "file": str(html_path),
+                "file": str(xml_path),
             })
             print(f"    § {sect_id}: {sect.get('label_description', '')[:60]}")
 
@@ -238,111 +238,82 @@ class ECFRFetcher:
 # Phase 2: HTML Parser → Node tree
 # ---------------------------------------------------------------------------
 
-def _extract_section_text(html: str) -> list[dict]:
-    """Parse eCFR section HTML into structured paragraphs.
+def _extract_section_text(xml: str) -> list[dict]:
+    """Parse eCFR section XML into structured paragraphs.
 
-    eCFR HTML uses semantic CSS classes for paragraph levels:
-      div.section — section container
-      div.section-heading — section number and subject
-      p.indent-1 through p.indent-7 — paragraph nesting levels
-      span.paragraph-hierarchy — paragraph markers like (a), (1), (ii)
+    eCFR versioner XML format (processed XML):
+      DIV8 TYPE="SECTION" — section container
+      HEAD — section heading (skipped here, handled by _extract_section_heading)
+      P — paragraph text; inline markers like (a), (1), (ii), (A) appear at
+          the start of the text content
 
     Returns list of {"marker": str, "text": str, "indent": int}
     """
-    soup = BeautifulSoup(html, "html.parser")
+    soup = BeautifulSoup(xml, "lxml-xml")
 
-    # Find the section content — eCFR wraps it in div.section
-    section_div = soup.select_one("div.section")
-    if not section_div:
-        # Fallback: try the whole body
-        section_div = soup.find("body") or soup
-        if not section_div:
-            return []
+    # Find the section element — TYPE="SECTION" on any DIV variant
+    section_el = (
+        soup.find(attrs={"TYPE": "SECTION"})
+        or soup.find("SECTION")
+        or soup
+    )
 
     paragraphs = []
 
-    for el in section_div.find_all(["p", "div"]):
-        # Skip nested divs that aren't paragraph containers
-        if el.name == "div" and "authority" not in el.get("class", []):
+    for p in section_el.find_all("P"):
+        text = p.get_text(" ", strip=True)
+        if not text:
             continue
 
-        classes = el.get("class", [])
-
-        # Determine indent level from CSS class
-        indent = 0
-        for cls in classes:
-            m = re.match(r"indent-(\d+)", cls)
-            if m:
-                indent = int(m.group(1))
-                break
-
-        # Extract paragraph marker from span.paragraph-hierarchy
+        # Paragraph markers appear inline at the start: "(a) ...", "(1) ..."
         marker = ""
-        hierarchy_span = el.select_one("span.paragraph-hierarchy")
-        if hierarchy_span:
-            marker_text = hierarchy_span.get_text(strip=True)
-            # Extract the marker: "(a)" → "a", "(1)" → "1"
-            m = re.match(r"^\(([^)]+)\)", marker_text)
-            if m:
-                marker = m.group(1)
+        m = re.match(r'^\(([^)]{1,6})\)\s*', text)
+        if m:
+            marker = m.group(1)
+            text = text[m.end():]
 
-        # Get full text, removing the hierarchy span to avoid duplication
-        if hierarchy_span:
-            hierarchy_span.decompose()
-
-        text = el.get_text(" ", strip=True)
         if not text:
             continue
 
         paragraphs.append({
             "marker": marker,
             "text": text,
-            "indent": indent,
+            "indent": 0,  # indent inferred from marker type in _build_paragraph_tree
         })
 
     return paragraphs
 
 
-def _extract_section_heading(html: str) -> tuple[str, str]:
-    """Extract section number and subject from eCFR HTML.
+def _extract_section_heading(xml: str) -> tuple[str, str]:
+    """Extract section number and subject from eCFR XML.
 
-    The eCFR renderer uses h4 tags with a data-hierarchy-metadata attribute:
-      <h4 data-hierarchy-metadata='{"path":"...","citation":"8 CFR 214.1"}'>
-        § 214.1 Requirements for admission...
-      </h4>
+    eCFR versioner XML uses a HEAD element inside the section DIV:
+      <DIV8 N="214.2" TYPE="SECTION">
+        <HEAD>§ 214.2 Special requirements for admission...</HEAD>
+        ...
+      </DIV8>
 
     Returns (section_number, subject).
-    e.g., ("214.1", "Requirements for admission, extension, and maintenance of status")
+    e.g., ("214.2", "Special requirements for admission, extension, and maintenance of status")
     """
-    soup = BeautifulSoup(html, "html.parser")
+    soup = BeautifulSoup(xml, "lxml-xml")
 
-    # Primary: find heading with data-hierarchy-metadata (most reliable)
-    heading = soup.find(attrs={"data-hierarchy-metadata": True})
-    if heading:
-        # Try to extract citation from metadata attribute
-        try:
-            meta = json.loads(heading["data-hierarchy-metadata"])
-            citation = meta.get("citation", "")
-            # "8 CFR 214.1" → "214.1"
-            m = re.search(r'CFR\s+([\d.]+)', citation)
-            if m:
-                sect_num = m.group(1)
-                # Get subject from text: "§ 214.1 Subject line here."
-                full_text = heading.get_text(strip=True)
-                m2 = re.match(r'§\s*[\d.]+\s*(.*)', full_text)
-                subject = m2.group(1).rstrip(".") if m2 else ""
-                return sect_num, subject
-        except (json.JSONDecodeError, KeyError):
-            pass
+    # Primary: HEAD element inside the section container
+    section_el = soup.find(attrs={"TYPE": "SECTION"}) or soup.find("SECTION")
+    head_el = section_el.find("HEAD") if section_el else soup.find("HEAD")
 
-    # Fallback: scan for § pattern in any heading tag
-    for tag in ["h4", "h3", "h2", "h1"]:
-        el = soup.find(tag)
-        if el:
-            text = el.get_text(strip=True)
-            m = re.match(r'§\s*([\d.]+)\s*(.*)', text)
-            if m:
-                return m.group(1), m.group(2).rstrip(".")
+    if head_el:
+        text = head_el.get_text(strip=True)
+        # "§ 214.2 Special requirements..." or "214.2 Special requirements..."
+        m = re.match(r'§?\s*([\d.]+)\s+(.*)', text)
+        if m:
+            return m.group(1), m.group(2).rstrip(".")
+
+    # Fallback: N attribute on the section element
+    if section_el:
+        n = section_el.get("N", "")
+        if n:
+            return n, ""
 
     return "", ""
 
@@ -615,10 +586,10 @@ def ingest_from_cache(db: Session, data_dir: Path):
                 print(f"    § {sect_id}: MISSING FILE")
                 continue
 
-            html = file_path.read_text(encoding="utf-8")
+            xml = file_path.read_text(encoding="utf-8")
 
-            # Extract heading from HTML (more reliable than structure metadata)
-            sect_num, subject = _extract_section_heading(html)
+            # Extract heading from XML (more reliable than structure metadata)
+            sect_num, subject = _extract_section_heading(xml)
             if not sect_num:
                 sect_num = sect_id
             if not subject:
@@ -648,7 +619,7 @@ def ingest_from_cache(db: Session, data_dir: Path):
             db.flush()
 
             # Parse section content into paragraph tree
-            paragraphs = _extract_section_text(html)
+            paragraphs = _extract_section_text(xml)
             _build_paragraph_tree(db, paragraphs, section_node.id, sect_num, base_level=2)
 
             child_count = db.query(Node).filter(Node.parent_id == section_node.id).count()
