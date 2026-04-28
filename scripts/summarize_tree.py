@@ -16,8 +16,11 @@ Rate limiting:
   Transient failures (429, 5xx) are retried with exponential backoff.
 
 Usage:
-    # Summarize all unsummarized nodes
+    # Summarize all unsummarized nodes (leaves + intermediate)
     python -m scripts.summarize_tree
+
+    # Summarize leaf nodes only — stops before intermediate nodes
+    python -m scripts.summarize_tree --leaves-only
 
     # Re-summarize everything (overwrite existing summaries)
     python -m scripts.summarize_tree --force
@@ -177,7 +180,7 @@ async def _summarize_intermediate(
 # Main pipeline
 # ---------------------------------------------------------------------------
 
-async def run_summarization(force: bool = False, dry_run: bool = False):
+async def run_summarization(force: bool = False, dry_run: bool = False, leaves_only: bool = False):
     """Run the bottom-up summarization pipeline."""
     Base.metadata.create_all(bind=engine)
 
@@ -239,9 +242,17 @@ async def run_summarization(force: bool = False, dry_run: bool = False):
                                 print(f"    Progress: {llm_calls} LLM calls made, processing node {i+1}/{len(level_node_ids)}")
                         else:
                             skipped += 1
-                        # Flush every 50 nodes to avoid large uncommitted batches
                         if (i + 1) % 50 == 0:
-                            db.flush()
+                            db.commit()
+                            print(f"    Committed {i + 1} nodes.")
+
+                    db.commit()
+                    print(f"  Level 0 complete. Total LLM calls so far: {llm_calls}")
+
+                    if leaves_only:
+                        print("\n--- Leaf nodes done. Stopping (--leaves-only). Run without --leaves-only to summarize intermediate nodes. ---")
+                        break
+
                 else:
                     print(f"\n--- Level {level_idx}: Summarizing {len(level_node_ids)} intermediate nodes ---")
                     for i, node_id in enumerate(level_node_ids):
@@ -254,9 +265,9 @@ async def run_summarization(force: bool = False, dry_run: bool = False):
                         else:
                             skipped += 1
                         if (i + 1) % 50 == 0:
-                            db.flush()
+                            db.commit()
 
-                db.flush()
+                db.commit()
                 print(f"  Level {level_idx} complete. Total LLM calls so far: {llm_calls}")
 
             db.commit()
@@ -272,9 +283,10 @@ def main():
     parser = argparse.ArgumentParser(description="Bottom-up LLM summarization of legal node tree")
     parser.add_argument("--force", action="store_true", help="Re-summarize all nodes, overwriting existing summaries")
     parser.add_argument("--dry-run", action="store_true", help="Show what would be summarized without calling LLM")
+    parser.add_argument("--leaves-only", action="store_true", help="Summarize leaf nodes only, then stop")
     args = parser.parse_args()
 
-    asyncio.run(run_summarization(force=args.force, dry_run=args.dry_run))
+    asyncio.run(run_summarization(force=args.force, dry_run=args.dry_run, leaves_only=args.leaves_only))
 
 
 if __name__ == "__main__":
