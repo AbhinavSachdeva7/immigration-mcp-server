@@ -180,7 +180,7 @@ async def _summarize_intermediate(
 # Main pipeline
 # ---------------------------------------------------------------------------
 
-async def run_summarization(force: bool = False, dry_run: bool = False, leaves_only: bool = False):
+async def run_summarization(force: bool = False, dry_run: bool = False, leaves_only: bool = False, force_from_level: int | None = None):
     """Run the bottom-up summarization pipeline."""
     Base.metadata.create_all(bind=engine)
 
@@ -235,7 +235,8 @@ async def run_summarization(force: bool = False, dry_run: bool = False, leaves_o
                     print(f"\n--- Level 0: Summarizing {len(level_node_ids)} leaf nodes ---")
                     for i, node_id in enumerate(level_node_ids):
                         node = node_map[node_id]
-                        called = await _summarize_leaf(client, node, force)
+                        level_force = force or (force_from_level is not None and level_idx >= force_from_level)
+                        called = await _summarize_leaf(client, node, level_force)
                         if called:
                             llm_calls += 1
                             if llm_calls % 10 == 0:
@@ -259,7 +260,8 @@ async def run_summarization(force: bool = False, dry_run: bool = False, leaves_o
                         node = node_map[node_id]
                         child_ids = children_map.get(node_id, [])
                         children = [node_map[cid] for cid in child_ids if cid in node_map]
-                        called = await _summarize_intermediate(client, node, children, force)
+                        level_force = force or (force_from_level is not None and level_idx >= force_from_level)
+                        called = await _summarize_intermediate(client, node, children, level_force)
                         if called:
                             llm_calls += 1
                         else:
@@ -284,9 +286,10 @@ def main():
     parser.add_argument("--force", action="store_true", help="Re-summarize all nodes, overwriting existing summaries")
     parser.add_argument("--dry-run", action="store_true", help="Show what would be summarized without calling LLM")
     parser.add_argument("--leaves-only", action="store_true", help="Summarize leaf nodes only, then stop")
+    parser.add_argument("--force-from-level", type=int, default=None, metavar="N", help="Force re-summarize all nodes at level N and above (e.g. --force-from-level 2)")
     args = parser.parse_args()
 
-    asyncio.run(run_summarization(force=args.force, dry_run=args.dry_run, leaves_only=args.leaves_only))
+    asyncio.run(run_summarization(force=args.force, dry_run=args.dry_run, leaves_only=args.leaves_only, force_from_level=args.force_from_level))
 
 
 if __name__ == "__main__":

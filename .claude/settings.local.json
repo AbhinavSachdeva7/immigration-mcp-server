@@ -2,7 +2,21 @@
   "permissions": {
     "allow": [
       "WebSearch",
-      "WebFetch(domain:uscode.house.gov)"
+      "WebFetch(domain:uscode.house.gov)",
+      "mcp__immigration-navigator__get_soc_children",
+      "mcp__immigration-navigator__get_soc_details",
+      "mcp__immigration-navigator__get_wage_data",
+      "mcp__immigration-navigator__read_legal_node",
+      "mcp__immigration-navigator__get_legal_leaf",
+      "mcp__immigration-navigator__get_legal_citations",
+      "mcp__immigration-navigator__get_soc_major_groups",
+      "mcp__immigration-navigator__get_server_info",
+      "mcp__immigration-navigator__resolve_msa",
+      "mcp__immigration-navigator__search_legal_nodes"
     ]
-  }
+  },
+  "enableAllProjectMcpServers": true,
+  "enabledMcpjsonServers": [
+    "immigration-navigator"
+  ]
 }

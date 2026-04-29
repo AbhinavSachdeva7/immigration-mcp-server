@@ -68,7 +68,8 @@ _MODEL_RPM: dict[str, int] = {
     # "gpt-4o":                   500,
     # "mistral-small-latest":      60,
     # "mistral-large-latest":      60,
-    "llama-3.1-8b-instant":          30,
+    "llama-3.1-8b-instant":                      28,
+    "meta-llama/llama-4-scout-17b-16e-instruct": 28,
     # "llama-3.3-70b-versatile":   30,
     "deepseek-ai/deepseek-v4-flash": 40,
     "openai/gpt-oss-120b":           30,
@@ -80,7 +81,7 @@ _PROVIDER_RPM: dict[str, int] = {
     "gemini":  14,
     "openai":  500,
     "mistral": 60,
-    "groq":    30,
+    "groq":    28,
     "ollama":  999,
     "nvidia":  40,
 }
@@ -259,53 +260,75 @@ class LLMClient:
 
         last_error = None
 
-        for slot in self.slots:
-            if not slot.is_available():
-                print(f"    [{slot.provider}/{slot.model}] Skipping — still cooling down.")
+        while True:
+            # Find available slots
+            available = [s for s in self.slots if s.is_available()]
+
+            if not available:
+                # All slots cooling — wait for the first one to recover then retry
+                wait = min(s.exhausted_until for s in self.slots) - time.monotonic()
+                wait = max(wait, 0.0)
+                print(f"    All slots cooling down. Waiting {wait:.0f}s for first slot to recover...")
+                await asyncio.sleep(wait)
                 continue
 
-            payload["model"] = slot.model
+            for slot in available:
+                payload["model"] = slot.model
 
-            for attempt in range(self.max_retries + 1):
-                await slot.rate_limiter.acquire()
+                for attempt in range(self.max_retries + 1):
+                    await slot.rate_limiter.acquire()
 
-                try:
-                    response = await slot._http_client.post("chat/completions", json=payload)
+                    try:
+                        response = await slot._http_client.post("chat/completions", json=payload)
 
-                    if response.status_code == 429:
-                        slot.mark_exhausted(60.0)
-                        print(f"    [{slot.provider}/{slot.model}] Rate limited — moving to next slot.")
+                        if response.status_code == 429:
+                            # Respect Retry-After header if present, otherwise parse from body
+                            retry_after = response.headers.get("retry-after") or response.headers.get("x-ratelimit-reset-requests")
+                            try:
+                                cooldown = float(retry_after) + 1.0 if retry_after else 10.0
+                            except (ValueError, TypeError):
+                                cooldown = 10.0
+                            slot.mark_exhausted(cooldown)
+                            print(f"    [{slot.provider}/{slot.model}] 429 — cooling {cooldown:.0f}s, moving to next slot.")
+                            break  # exit retry loop, try next slot
+
+                        if response.status_code >= 500:
+                            wait = 2 ** attempt
+                            print(f"    [{slot.provider}/{slot.model}] Server error {response.status_code}, retrying in {wait}s...")
+                            await asyncio.sleep(wait)
+                            continue
+
+                        response.raise_for_status()
+                        data = response.json()
+                        choices = data.get("choices", [])
+                        if choices:
+                            content = choices[0]["message"]["content"].strip()
+                            suffix = "..." if len(content) > 120 else ""
+                            print(f"    [{slot.provider}/{slot.model}] Summary: {content[:120]}{suffix}")
+                            return content
+                        return ""
+
+                    except httpx.TimeoutException:
+                        last_error = f"[{slot.provider}/{slot.model}] timed out"
+                        slot.mark_exhausted(30.0)
+                        print(f"    {last_error} — moving to next slot.")
                         break  # exit retry loop, try next slot
 
-                    if response.status_code >= 500:
-                        wait = 2 ** attempt
-                        print(f"    [{slot.provider}/{slot.model}] Server error {response.status_code}, retrying in {wait}s...")
-                        await asyncio.sleep(wait)
-                        continue
+                    except httpx.HTTPStatusError as e:
+                        last_error = f"HTTP {e.response.status_code}"
+                        if e.response.status_code < 500:
+                            raise
+                        await asyncio.sleep(2 ** attempt)
 
-                    response.raise_for_status()
-                    data = response.json()
-                    choices = data.get("choices", [])
-                    if choices:
-                        return choices[0]["message"]["content"].strip()
-                    return ""
+            # All available slots tried this round — loop back to check cooldowns
+            if all(not s.is_available() for s in self.slots):
+                continue  # will hit the wait-for-recovery branch above
 
-                except httpx.TimeoutException:
-                    last_error = f"[{slot.provider}/{slot.model}] timed out"
-                    slot.mark_exhausted(30.0)
-                    print(f"    {last_error} — moving to next slot.")
-                    break  # exit retry loop, try next slot
-
-                except httpx.HTTPStatusError as e:
-                    last_error = f"HTTP {e.response.status_code}"
-                    if e.response.status_code < 500:
-                        raise
-                    await asyncio.sleep(2 ** attempt)
-
-        raise RuntimeError(
-            f"All model slots exhausted or failed. Last error: {last_error}. "
-            f"Slots tried: {[f'{s.provider}/{s.model}' for s in self.slots]}"
-        )
+            # At least one slot is available but all failed with non-429 errors
+            raise RuntimeError(
+                f"All model slots failed. Last error: {last_error}. "
+                f"Slots tried: {[f'{s.provider}/{s.model}' for s in self.slots]}"
+            )
 
     async def summarize_text(self, text: str, max_tokens: int = 200) -> str:
         """Summarize a piece of legal text (for leaf nodes)."""

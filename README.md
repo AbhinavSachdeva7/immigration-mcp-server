@@ -133,11 +133,26 @@ docker compose up db -d
 pip install -e .
 ```
 
-### 4. Download Data Files
+### 4. Load the Database
 
-Download the manually-sourced datasets (O\*NET, OFLC wages, SOC structure, HUD crosswalk) and place them in `./data/` as described in [DATA_SOURCES.md](DATA_SOURCES.md).
+**Option A — Pre-built dump (recommended):** Download the pre-populated database dump from the [latest GitHub Release](../../releases/latest) and restore it into Docker. This skips all manual data downloads and ingestion scripts.
+
+```bash
+# Start the database container
+docker compose up db -d
+
+# Copy the dump into the container and restore
+docker cp immigration_mcp.dump immigration_mcp_db:/tmp/
+docker exec immigration_mcp_db pg_restore -U postgres -d immigration_mcp /tmp/immigration_mcp.dump
+```
+
+Then jump straight to [step 6](#6-run-the-server) — no ingestion needed.
+
+**Option B — Ingest from source:** Download the manually-sourced datasets (O\*NET, OFLC wages, SOC structure, HUD crosswalk) and place them in `./data/` as described in [DATA_SOURCES.md](DATA_SOURCES.md).
 
 ### 5. Run Ingestion
+
+> Skip this step if you restored from the pre-built dump (Option A above).
 
 ```bash
 # Structured data (occupations, wages, geography)

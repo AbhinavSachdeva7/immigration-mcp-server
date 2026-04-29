@@ -4,6 +4,7 @@ from datetime import datetime
 from mcp.server.fastmcp import FastMCP
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any
+from sqlalchemy import func
 
 from src.db.database import SessionLocal, engine, Base
 from src.db.models import (
@@ -17,8 +18,9 @@ Base.metadata.create_all(bind=engine)
 # Configure FastMCP
 mcp = FastMCP(
     "immigration-navigator",
-    version=os.getenv("MCP_SERVER_VERSION", "0.1.0"),
-    description="MCP Server for U.S. Immigration Law and SOC/Wage Discovery"
+    instructions="MCP Server for U.S. Immigration Law and SOC/Wage Discovery",
+    host="0.0.0.0",
+    port=8000
 )
 
 # ==========================================
@@ -104,6 +106,50 @@ def get_soc_details(soc_code: str) -> Dict[str, Any]:
         }
 
 # ==========================================
+# HITL: SOC Disambiguation
+# ==========================================
+
+@mcp.tool()
+def request_soc_clarification(candidates: List[Dict[str, Any]], question: str) -> Dict[str, Any]:
+    """
+    Use this tool ONLY when you cannot confidently determine the right SOC code
+    because two or more codes are genuinely plausible for the described role.
+    Do NOT call this for clearly defined roles — use your judgment and pick the
+    best fit directly.
+
+    When to call:
+    - The job title maps to multiple detailed occupations with overlapping duties
+      (e.g., "data engineer" could be 15-1243 or 15-1244)
+    - The petitioner's duties span two SOC categories with no dominant fit
+    - The user's job description is ambiguous about whether the role is technical
+      or managerial
+
+    When NOT to call:
+    - The role is clearly a known occupation (e.g., "software developer" → 15-1252)
+    - You have already identified the best fit with high confidence
+
+    candidates: list of dicts, each with keys:
+      - soc_code: str
+      - title: str
+      - reasoning: str  (why this code is a plausible match)
+      - key_difference: str  (what distinguishes it from the other candidates)
+
+    question: the specific question to ask the user to resolve the ambiguity
+      e.g., "Does the role involve primarily writing code, or primarily designing systems?"
+
+    Returns the candidates and question formatted for presentation to the user.
+    After calling this tool, present the results to the user and wait for their
+    answer before proceeding.
+    """
+    log_audit("request_soc_clarification", {"candidates": candidates, "question": question})
+    return {
+        "status": "awaiting_user_input",
+        "question_for_user": question,
+        "candidates": candidates,
+        "instruction": "Present these candidates and the question to the user. Wait for their response before selecting a SOC code.",
+    }
+
+# ==========================================
 # Wage & MSA Tools
 # ==========================================
 
@@ -163,7 +209,70 @@ def get_wage_data(soc_code: str, msa_area: str) -> Dict[str, Any]:
 # ==========================================
 # Legal Navigation Tools
 # ==========================================
-#  
+
+@mcp.tool()
+def search_legal_nodes(query: str) -> str:
+    """
+    Search the legal database by citation, keyword, or topic before citing any law.
+
+    ALWAYS call this first when you know a specific provision you need
+    (e.g. 'INA 212', '8 CFR 214.2', 'unlawful presence', 'AC21 portability').
+
+    CRITICAL RULES:
+    - If this returns results: use those node IDs to retrieve the actual text
+      via read_legal_node and get_legal_leaf before citing anything.
+    - If this returns empty: that provision is NOT in the indexed database.
+      Do NOT cite it from memory. Tell the user explicitly:
+      "This provision (X) is not in the indexed database and cannot be
+      verified from retrieved text. You should consult the primary source directly."
+    - Never cite a legal provision that did not appear in search results
+      or tree traversal in this conversation.
+    """
+    log_audit("search_legal_nodes", {"query": query})
+    with SessionLocal() as db:
+        terms = query.strip().split()
+        conditions = []
+        for term in terms:
+            conditions.append(Node.title.ilike(f"%{term}%"))
+            conditions.append(Node.citation.ilike(f"%{term}%"))
+            conditions.append(Node.summary.ilike(f"%{term}%"))
+
+        from sqlalchemy import or_
+        results = (
+            db.query(Node)
+            .filter(or_(*conditions))
+            .order_by(Node.level)
+            .limit(15)
+            .all()
+        )
+
+        if not results:
+            return _wrap_legal_response(
+                json.dumps({
+                    "found": False,
+                    "query": query,
+                    "message": f"No indexed nodes found matching '{query}'. This provision is not in the database. Do not cite it from memory.",
+                }, ensure_ascii=False)
+            )
+
+        return _wrap_legal_response(
+            json.dumps({
+                "found": True,
+                "query": query,
+                "results": [
+                    {
+                        "node_id": n.id,
+                        "title": n.title,
+                        "citation": n.citation,
+                        "summary": n.summary,
+                        "is_leaf": n.full_text is not None,
+                    }
+                    for n in results
+                ],
+            }, indent=2, ensure_ascii=False)
+        )
+
+#
 @mcp.tool()
 def read_legal_node(node_id: Optional[int] = None) -> str:
     """
@@ -180,22 +289,32 @@ def read_legal_node(node_id: Optional[int] = None) -> str:
             query = query.filter(Node.parent_id == node_id)
             
         nodes = query.order_by(Node.id).all()
-        
+
         if not nodes:
             return _wrap_legal_response(f"No children found for node_id {node_id}")
-            
+
+        # One query to get child counts for all returned nodes
+        node_ids = [n.id for n in nodes]
+        child_counts = dict(
+            db.query(Node.parent_id, func.count(Node.id))
+            .filter(Node.parent_id.in_(node_ids))
+            .group_by(Node.parent_id)
+            .all()
+        )
+
         results = []
         for n in nodes:
+            has_children = child_counts.get(n.id, 0) > 0
             results.append({
                 "node_id": n.id,
                 "title": n.title,
                 "summary": n.summary,
                 "citation": n.citation,
-                "is_leaf": n.full_text is not None
+                "is_leaf": n.full_text is not None or not has_children
             })
             
         # Return as pretty json string wrapped in UPL disclaimer
-        return _wrap_legal_response(json.dumps(results, indent=2))
+        return _wrap_legal_response(json.dumps(results, indent=2, ensure_ascii=False))
 
 @mcp.tool()
 def get_legal_leaf(node_id: int) -> str:
@@ -209,26 +328,28 @@ def get_legal_leaf(node_id: int) -> str:
         
         if not node:
             return _wrap_legal_response(f"Node {node_id} not found.")
-            
-        if not node.full_text:
+
+        # A node is a leaf if it has full_text OR if it has no children
+        has_children = db.query(Node).filter(Node.parent_id == node_id).limit(1).count() > 0
+        if not node.full_text and has_children:
             return _wrap_legal_response(f"Node {node_id} is not a leaf node. Use read_legal_node to traverse deeper.")
-            
+
         # Get OUTBOUND cross references (where this node points TO other nodes)
         xrefs = db.query(NodeCrossReference).filter(NodeCrossReference.source_node_id == node_id).all()
-        
+
         result = {
             "node_id": node.id,
             "title": node.title,
             "citation": node.citation,
-            "text": node.full_text,
+            "text": node.full_text or node.summary,
             "metadata": node.metadata_,
             "cross_references": [
-                {"target_node_id": x.target_node_id, "reference_text": x.reference_text} 
+                {"target_node_id": x.target_node_id, "reference_text": x.reference_text}
                 for x in xrefs
             ]
         }
         
-        return _wrap_legal_response(json.dumps(result, indent=2))
+        return _wrap_legal_response(json.dumps(result, indent=2, ensure_ascii=False))
 
 @mcp.tool()
 def get_legal_citations(node_ids: List[int]) -> str:
@@ -239,7 +360,7 @@ def get_legal_citations(node_ids: List[int]) -> str:
     with SessionLocal() as db:
         nodes = db.query(Node).filter(Node.id.in_(node_ids)).all()
         citations = {n.id: n.citation for n in nodes if n.citation}
-        return _wrap_legal_response(json.dumps(citations, indent=2))
+        return _wrap_legal_response(json.dumps(citations, indent=2, ensure_ascii=False))
 
 @mcp.tool()
 def get_server_info() -> Dict[str, Any]:

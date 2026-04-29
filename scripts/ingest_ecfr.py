@@ -402,7 +402,7 @@ def _build_paragraph_tree(
         # Build citation: 8 CFR § 214.2(h)(4)(ii)
         citation_parts = [f"({s[0]})" for s in stack]
         citation_parts.append(f"({marker})")
-        citation = f"8 CFR §{section_num}{''.join(citation_parts)}" if section_num else None
+        citation = f"8 CFR § {section_num}{''.join(citation_parts)}" if section_num else None
 
         # Build title from marker + start of text
         title = f"({marker})"
@@ -556,9 +556,9 @@ def ingest_from_cache(db: Session, data_dir: Path):
         part_label = f"Part {part_num}"
         if part_structure_path.exists():
             ps = json.loads(part_structure_path.read_text(encoding="utf-8"))
-            part_label = ps.get("label", part_label)
+            part_label = _clean_label(ps.get("label", part_label))
             if ps.get("label_description"):
-                part_label += f" — {ps['label_description']}"
+                part_label += f" — {_clean_label(ps['label_description'])}"
 
         # Create part node
         part_node = Node(
@@ -595,6 +595,10 @@ def ingest_from_cache(db: Session, data_dir: Path):
             if not subject:
                 subject = label_desc
 
+            # Normalize unicode from raw XML before storing
+            sect_num = _clean_label(sect_num)
+            subject = _clean_label(subject)
+
             section_title = f"§ {sect_num}"
             if subject:
                 section_title += f" {subject}"
@@ -607,7 +611,7 @@ def ingest_from_cache(db: Session, data_dir: Path):
                 parent_id=parent_id,
                 level=2,
                 title=section_title,
-                citation=f"8 CFR §{sect_num}",
+                citation=f"8 CFR § {sect_num}",
                 metadata_={
                     "cfr_title": "8",
                     "cfr_part": str(part_num),
@@ -630,75 +634,66 @@ def ingest_from_cache(db: Session, data_dir: Path):
     db.commit()
 
 
+def _clean_label(text: str) -> str:
+    """Normalize unicode characters common in eCFR labels."""
+    if not text:
+        return text
+    return (
+        text.replace('\u00a0', ' ')   # non-breaking space → regular space
+            .replace('\u2014', '—')   # em dash (already readable, keep as-is)
+            .replace('\u00a7', '§')   # section sign
+            .strip()
+    )
+
+
 def _build_subpart_nodes(
     db: Session, data_dir: Path, part_num: int, part_node_id: int
 ) -> dict[str, int]:
     """Create subpart nodes from the part structure if subparts exist.
 
-    Returns a mapping of subpart identifier → node_id.
+    Returns a mapping of section_identifier → subpart_node_id, built directly
+    from the children listed under each subpart in structure.json.
     """
     part_structure_path = data_dir / f"part-{part_num}" / "structure.json"
     if not part_structure_path.exists():
         return {}
 
     structure = json.loads(part_structure_path.read_text(encoding="utf-8"))
-    subpart_map = {}
+    # section_identifier → subpart_node_id
+    subpart_map: dict[str, int] = {}
 
     for child in structure.get("children", []):
-        if child.get("type") == "subpart":
-            sp_id = child.get("identifier", "")
-            sp_label = child.get("label", f"Subpart {sp_id}")
-            if child.get("label_description"):
-                sp_label += f" — {child['label_description']}"
+        if child.get("type") != "subpart":
+            continue
 
-            sp_node = Node(
-                source="ecfr",
-                parent_id=part_node_id,
-                level=1,
-                title=sp_label,
-                summary=f"8 CFR Part {part_num}, {sp_label}",
-                citation=f"8 CFR Part {part_num}, Subpart {sp_id}",
-                metadata_={"cfr_part": str(part_num), "subpart": sp_id},
-            )
-            db.add(sp_node)
-            db.flush()
+        sp_id = child.get("identifier", "")
+        sp_label = _clean_label(child.get("label", f"Subpart {sp_id}"))
 
-            # Map section ranges to this subpart
-            desc_range = child.get("descendant_range", "")
-            if desc_range:
-                subpart_map[sp_id] = {
-                    "node_id": sp_node.id,
-                    "range": desc_range,
-                }
+        sp_node = Node(
+            source="ecfr",
+            parent_id=part_node_id,
+            level=2,
+            title=sp_label,
+            summary=f"8 CFR Part {part_num}, {sp_label}",
+            citation=f"8 CFR Part {part_num}, Subpart {sp_id}",
+            metadata_={"cfr_part": str(part_num), "subpart": sp_id},
+        )
+        db.add(sp_node)
+        db.flush()
+
+        # Map every section listed under this subpart directly
+        for sect in child.get("children", []):
+            if sect.get("type") == "section":
+                subpart_map[sect["identifier"]] = sp_node.id
 
     return subpart_map
 
 
 def _find_subpart_parent(
-    subpart_map: dict, section_num: str, default_parent: int
+    subpart_map: dict[str, int], section_num: str, default_parent: int
 ) -> int:
-    """Find which subpart a section belongs to based on section number ranges."""
-    if not subpart_map:
-        return default_parent
-
-    for sp_id, info in subpart_map.items():
-        range_str = info.get("range", "")
-        if not range_str:
-            continue
-
-        # Range format from eCFR: "214.1 to 214.99" or similar
-        parts = range_str.split(" to ")
-        if len(parts) == 2:
-            try:
-                start = float(parts[0].strip())
-                end = float(parts[1].strip())
-                sect_float = float(section_num)
-                if start <= sect_float <= end:
-                    return info["node_id"]
-            except ValueError:
-                continue
-
-    return default_parent
+    """Find which subpart a section belongs to via direct identifier lookup."""
+    return subpart_map.get(section_num, default_parent)
 
 
 # ---------------------------------------------------------------------------
